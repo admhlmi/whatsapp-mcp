@@ -641,7 +641,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -775,7 +775,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
+	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
 	// Run server in a goroutine so it doesn't block
@@ -800,14 +800,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -922,13 +922,48 @@ func main() {
 	client.Disconnect()
 }
 
+// resolveContactName returns the best saved name for a contact, trying the JID itself
+// and its LID/phone-number counterpart. Prefers full name, then push name.
+func resolveContactName(client *whatsmeow.Client, jid types.JID) string {
+	ctx := context.Background()
+	candidates := []types.JID{jid}
+	if jid.Server == types.HiddenUserServer {
+		if pn, err := client.Store.LIDs.GetPNForLID(ctx, jid); err == nil && !pn.IsEmpty() {
+			candidates = append(candidates, pn)
+		}
+	} else if jid.Server == types.DefaultUserServer {
+		if lid, err := client.Store.LIDs.GetLIDForPN(ctx, jid); err == nil && !lid.IsEmpty() {
+			candidates = append(candidates, lid)
+		}
+	}
+	var fallback string
+	for _, c := range candidates {
+		contact, err := client.Store.Contacts.GetContact(ctx, c)
+		if err != nil {
+			continue
+		}
+		if contact.FullName != "" {
+			return contact.FullName
+		}
+		if fallback == "" {
+			for _, n := range []string{contact.PushName, contact.FirstName, contact.BusinessName} {
+				if n != "" {
+					fallback = n
+					break
+				}
+			}
+		}
+	}
+	return fallback
+}
+
 // GetChatName determines the appropriate name for a chat based on JID and other info
 func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, chatJID string, conversation interface{}, sender string, logger waLog.Logger) string {
 	// First, check if chat already exists in database with a name
 	var existingName string
 	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
-	if err == nil && existingName != "" {
-		// Chat exists with a name, use that
+	if err == nil && existingName != "" && existingName != jid.User {
+		// Chat exists with a real name (not just the raw number), use that
 		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
 		return existingName
 	}
@@ -973,7 +1008,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -987,10 +1022,9 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		// This is an individual contact
 		logger.Infof("Getting name for contact: %s", chatJID)
 
-		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
-		if err == nil && contact.FullName != "" {
-			name = contact.FullName
+		// Use contact info, checking the LID/phone-number counterpart too
+		if n := resolveContactName(client, jid); n != "" {
+			name = n
 		} else if sender != "" {
 			// Fallback to sender
 			name = sender

@@ -8,6 +8,7 @@ import json
 import audio
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
+WHATSAPP_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'whatsapp.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
 
 @dataclass
@@ -52,6 +53,8 @@ def get_sender_name(sender_jid: str) -> str:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
         
+        phone_part = sender_jid.split('@')[0]
+
         # First try matching by exact JID
         cursor.execute("""
             SELECT name
@@ -64,12 +67,6 @@ def get_sender_name(sender_jid: str) -> str:
         
         # If no result, try looking for the number within JIDs
         if not result:
-            # Extract the phone number part if it's a JID
-            if '@' in sender_jid:
-                phone_part = sender_jid.split('@')[0]
-            else:
-                phone_part = sender_jid
-                
             cursor.execute("""
                 SELECT name
                 FROM chats
@@ -79,10 +76,29 @@ def get_sender_name(sender_jid: str) -> str:
             
             result = cursor.fetchone()
         
-        if result and result[0]:
+        if result and result[0] and result[0] != phone_part:
             return result[0]
-        else:
-            return sender_jid
+
+        # Fall back to the WhatsApp contact store (also resolves LIDs via lid_map)
+        wconn = sqlite3.connect(WHATSAPP_DB_PATH)
+        try:
+            wcur = wconn.cursor()
+            wcur.execute("""
+                SELECT COALESCE(NULLIF(ct.full_name,''), NULLIF(ct.push_name,''),
+                                NULLIF(ct.first_name,''), NULLIF(ct.business_name,''))
+                FROM whatsmeow_contacts ct
+                WHERE ct.their_jid IN (
+                    ? || '@lid', ? || '@s.whatsapp.net',
+                    (SELECT pn || '@s.whatsapp.net' FROM whatsmeow_lid_map WHERE lid = ?),
+                    (SELECT lid || '@lid' FROM whatsmeow_lid_map WHERE pn = ?))
+                ORDER BY (ct.full_name <> '') DESC, (ct.push_name <> '') DESC
+            """, (phone_part, phone_part, phone_part, phone_part))
+            for (n,) in wcur.fetchall():
+                if n:
+                    return n
+        finally:
+            wconn.close()
+        return sender_jid
         
     except sqlite3.Error as e:
         print(f"Database error while getting sender name: {e}")
